@@ -30,7 +30,7 @@ Download the script:
 
 .. code-block:: bash
 
-    wget https://github.com/Eyesnakee/i3focusmouse/i3focusmouse.py
+    wget https://github.com/Eyesnakee/i3focusmouse/raw/refs/heads/main/i3focusmouse.py
 
 Make it executable:
 
