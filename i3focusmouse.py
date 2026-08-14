@@ -217,6 +217,9 @@ async def on_i3_binding(i3_connection, event):
         elif first == "focus" and second == "mode_toggle":
             if BIND_MODE_TOGGLE == "MOVE":
                 asyncio.create_task(adjust_cursor_after_focus(i3_connection))
+        elif first == "layout":
+            asyncio.create_task(schedule_focus(0.0))
+            asyncio.create_task(schedule_focus(0.1))
 
 
 async def on_workspace_focus(i3_connection, event):
