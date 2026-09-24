@@ -7,25 +7,28 @@ import sys
 import argparse
 import os
 import xcffib
-from xcffib.xproto import MapState, Time
+from xcffib.xproto import (
+    MapState, Time, CW, EventMask,
+    CreateNotifyEvent, UnmapNotifyEvent, DestroyNotifyEvent,
+)
 
-# BIND_FOCUS: "NONE" - do nothing, "MOVE" - to the center of the window affected by the binding
-BIND_FOCUS = "MOVE"
-# BIND_MOVE: "NONE" - do nothing, "FOCUS" - focus window under mouse, "MOVE" - to the center of the window affected by the binding
-BIND_MOVE = "MOVE"
-# BIND_MODE_TOGGLE: "NONE" - do nothing, "MOVE" - center cursor to the center of the window affected by the binding
-BIND_MODE_TOGGLE = "MOVE"
+BIND_FOCUS = "MOVE" # "NONE" - do nothing, "MOVE" - to the center of the window affected by the binding
+BIND_MOVE = "MOVE" # "NONE" - do nothing, "FOCUS" - focus window under mouse, "MOVE" - to the center of the window affected by the binding
+BIND_MODE_TOGGLE = "MOVE" # "NONE" - do nothing, "MOVE" - center cursor to the center of the window affected by the binding
 
 is_running = True
 xcb_connection = None
 scheduled_focus_task = None
 main_loop_task = None
+x_event_task = None
+x_event_connection = None
+override_redirect_windows = set()
 
 
 def find_client_window(window):
     try:
         attrs = xcb_connection.core.GetWindowAttributes(window).reply()
-        if attrs.map_state == MapState.Viewable and attrs.override_redirect == 0:
+        if attrs.map_state == MapState.Viewable and not attrs.override_redirect:
             return window
     except:
         pass
@@ -45,11 +48,11 @@ def get_window_under_mouse():
     try:
         root = xcb_connection.get_setup().roots[0].root
         pointer = xcb_connection.core.QueryPointer(root).reply()
-        if pointer is None or pointer.child == 0:
-            return None
-        return pointer.child
+        if pointer and pointer.child:
+            return pointer.child
     except:
-        return None
+        pass
+    return None
 
 
 def _focus_window_under_mouse_sync():
@@ -60,7 +63,7 @@ def _focus_window_under_mouse_sync():
         attrs = xcb_connection.core.GetWindowAttributes(child).reply()
         if attrs is None:
             return
-        if attrs.override_redirect == 1:
+        if attrs.override_redirect:
             client = find_client_window(child)
             if client is not None:
                 child = client
@@ -116,26 +119,25 @@ def _find_deepest_viewable(window, x, y):
         if geo is None:
             return None
         wx, wy, ww, wh = geo
-        if x >= wx and x < wx + ww and y >= wy and y < wy + wh:
+        if wx <= x < wx + ww and wy <= y < wy + wh:
             return window
-        return None
     except:
-        return None
+        pass
+    return None
 
 
 def get_topmost_window_at_point(x, y):
     root = xcb_connection.get_setup().roots[0].root
     try:
         tree = xcb_connection.core.QueryTree(root).reply()
-        if tree is None or not tree.children:
-            return None
-        for child in reversed(tree.children):
-            deepest = _find_deepest_viewable(child, x, y)
-            if deepest is not None:
-                return deepest
-        return None
+        if tree and tree.children:
+            for child in reversed(tree.children):
+                deepest = _find_deepest_viewable(child, x, y)
+                if deepest is not None:
+                    return deepest
     except:
-        return None
+        pass
+    return None
 
 
 def move_cursor_to_point(x, y):
@@ -151,19 +153,16 @@ def move_cursor_to_topmost_at_point(cx, cy):
         return
     while True:
         center = get_window_center(current)
-        if center is None:
+        if center is None or center == (cx, cy):
             break
-        cx2, cy2 = center
-        if (cx2, cy2) == (cx, cy):
-            break
-        cx, cy = cx2, cy2
+        cx, cy = center
         next_win = get_topmost_window_at_point(cx, cy)
         if next_win is None or next_win == current:
             break
         current = next_win
     center_final = get_window_center(current)
     if center_final is not None:
-        move_cursor_to_point(center_final[0], center_final[1])
+        move_cursor_to_point(*center_final)
 
 
 async def adjust_cursor_after_focus(i3_connection):
@@ -198,65 +197,127 @@ async def schedule_focus(delay):
         scheduled_focus_task = asyncio.create_task(delayed())
 
 
+async def refresh_focus(*_args):
+    await schedule_focus(0.0)
+    asyncio.create_task(schedule_focus(0.1))
+
+
 async def on_i3_binding(i3_connection, event):
-    command = event.binding.command.strip()
-    parts = command.split()
-    if len(parts) >= 2:
-        first = parts[0]
-        second = parts[1]
-        directions = ("left", "right", "up", "down")
-        if first == "move" and second in directions:
-            if BIND_MOVE == "MOVE":
-                asyncio.create_task(adjust_cursor_after_focus(i3_connection))
-            elif BIND_MOVE == "FOCUS":
-                asyncio.create_task(schedule_focus(0.0))
-                asyncio.create_task(schedule_focus(0.1))
-        elif first == "focus" and second in directions:
-            if BIND_FOCUS == "MOVE":
-                asyncio.create_task(adjust_cursor_after_focus(i3_connection))
-        elif first == "focus" and second == "mode_toggle":
-            if BIND_MODE_TOGGLE == "MOVE":
-                asyncio.create_task(adjust_cursor_after_focus(i3_connection))
-        elif first == "layout":
-            asyncio.create_task(schedule_focus(0.0))
-            asyncio.create_task(schedule_focus(0.1))
+    parts = event.binding.command.strip().split()
+    if len(parts) < 2:
+        return
+    first, second = parts[0], parts[1]
+    directions = ("left", "right", "up", "down")
+    if first == "move" and second in directions:
+        if BIND_MOVE == "MOVE":
+            asyncio.create_task(adjust_cursor_after_focus(i3_connection))
+        elif BIND_MOVE == "FOCUS":
+            asyncio.create_task(refresh_focus())
+    elif first == "focus" and second in directions:
+        if BIND_FOCUS == "MOVE":
+            asyncio.create_task(adjust_cursor_after_focus(i3_connection))
+    elif first == "focus" and second == "mode_toggle":
+        if BIND_MODE_TOGGLE == "MOVE":
+            asyncio.create_task(adjust_cursor_after_focus(i3_connection))
+    elif first == "layout":
+        asyncio.create_task(refresh_focus())
 
 
-async def on_workspace_focus(i3_connection, event):
-    await schedule_focus(0.0)
-    asyncio.create_task(schedule_focus(0.1))
+def _subscribe_window(window):
+    try:
+        x_event_connection.core.ChangeWindowAttributes(
+            window, CW.EventMask, [EventMask.SubstructureNotify]
+        )
+    except:
+        pass
 
 
-async def on_window_event(i3_connection, event):
-    await schedule_focus(0.0)
-    asyncio.create_task(schedule_focus(0.1))
+def _scan_tree_recursive(window, depth=0):
+    if depth > 32:
+        return
+    try:
+        attrs = x_event_connection.core.GetWindowAttributes(window).reply()
+        if attrs is not None and attrs.override_redirect:
+            override_redirect_windows.add(window)
+    except:
+        pass
+    _subscribe_window(window)
+    try:
+        tree = x_event_connection.core.QueryTree(window).reply()
+        if tree and tree.children:
+            for child in tree.children:
+                _scan_tree_recursive(child, depth + 1)
+    except:
+        pass
 
 
-async def on_window_resize(i3_connection, event):
-    await schedule_focus(0.0)
-    asyncio.create_task(schedule_focus(0.1))
+def handle_x_event(event):
+    if isinstance(event, CreateNotifyEvent):
+        if event.override_redirect:
+            override_redirect_windows.add(event.window)
+        _subscribe_window(event.window)
+        try:
+            tree = x_event_connection.core.QueryTree(event.window).reply()
+            if tree and tree.children:
+                for child in tree.children:
+                    _scan_tree_recursive(child, 1)
+        except:
+            pass
+        try:
+            x_event_connection.flush()
+        except:
+            pass
+    elif isinstance(event, (UnmapNotifyEvent, DestroyNotifyEvent)):
+        if event.window in override_redirect_windows:
+            override_redirect_windows.discard(event.window)
+            if isinstance(event, UnmapNotifyEvent) and is_running:
+                asyncio.create_task(refresh_focus())
 
 
-async def on_window_fullscreen(i3_connection, event):
-    await schedule_focus(0.0)
-    asyncio.create_task(schedule_focus(0.1))
+async def listen_x_events():
+    global x_event_connection
+    try:
+        x_event_connection = xcffib.connect()
+    except Exception:
+        return
+    try:
+        _scan_tree_recursive(x_event_connection.get_setup().roots[0].root)
+        try:
+            x_event_connection.flush()
+        except:
+            pass
+        while is_running:
+            try:
+                event = x_event_connection.poll_for_event()
+            except Exception:
+                await asyncio.sleep(0.1)
+                continue
+            if event is None:
+                await asyncio.sleep(0.05)
+                continue
+            handle_x_event(event)
+    finally:
+        try:
+            x_event_connection.disconnect()
+        except Exception:
+            pass
+        x_event_connection = None
 
 
 async def run_i3_event_loop():
-    global is_running, main_loop_task
+    global main_loop_task
     while is_running:
         try:
             i3_connection = await i3ipc.Connection().connect()
             i3_connection.on("binding", on_i3_binding)
-            i3_connection.on("workspace::focus", on_workspace_focus)
-            i3_connection.on("window::new", on_window_event)
-            i3_connection.on("window::close", on_window_event)
-            i3_connection.on("window::floating", on_window_event)
-            i3_connection.on("window::resize", on_window_resize)
-            i3_connection.on("window::fullscreen_mode", on_window_fullscreen)
+            i3_connection.on("workspace::focus", refresh_focus)
+            i3_connection.on("window::new", refresh_focus)
+            i3_connection.on("window::close", refresh_focus)
+            i3_connection.on("window::floating", refresh_focus)
+            i3_connection.on("window::resize", refresh_focus)
+            i3_connection.on("window::fullscreen_mode", refresh_focus)
 
-            await schedule_focus(0.0)
-            asyncio.create_task(schedule_focus(0.1))
+            await refresh_focus()
 
             main_loop_task = asyncio.create_task(i3_connection.main())
             await main_loop_task
@@ -271,7 +332,7 @@ async def run_i3_event_loop():
 
 
 async def main():
-    global xcb_connection, is_running
+    global xcb_connection, is_running, x_event_task
 
     parser = argparse.ArgumentParser()
     parser.add_argument("--nice", type=int, help="nice value to set")
@@ -284,7 +345,7 @@ async def main():
         except:
             pass
     if args.realtime is not None:
-        if args.realtime < 1 or args.realtime > 99:
+        if not 1 <= args.realtime <= 99:
             print("Error: realtime priority must be between 1 and 99", file=sys.stderr)
             sys.exit(1)
         try:
@@ -301,26 +362,28 @@ async def main():
     loop = asyncio.get_running_loop()
 
     def shutdown():
-        global is_running, main_loop_task
+        global is_running
         if not is_running:
             return
         is_running = False
-        if main_loop_task is not None and not main_loop_task.done():
-            main_loop_task.cancel()
-        if scheduled_focus_task is not None and not scheduled_focus_task.done():
-            scheduled_focus_task.cancel()
+        for task in (main_loop_task, scheduled_focus_task, x_event_task):
+            if task is not None and not task.done():
+                task.cancel()
 
     loop.add_signal_handler(signal.SIGINT, shutdown)
     loop.add_signal_handler(signal.SIGTERM, shutdown)
 
+    x_event_task = asyncio.create_task(listen_x_events())
+
     await run_i3_event_loop()
 
-    if scheduled_focus_task is not None and not scheduled_focus_task.done():
-        scheduled_focus_task.cancel()
-        try:
-            await scheduled_focus_task
-        except asyncio.CancelledError:
-            pass
+    for task in (scheduled_focus_task, x_event_task):
+        if task is not None and not task.done():
+            task.cancel()
+            try:
+                await task
+            except asyncio.CancelledError:
+                pass
     if xcb_connection is not None:
         try:
             xcb_connection.disconnect()
