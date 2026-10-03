@@ -10,6 +10,7 @@ import xcffib
 from xcffib.xproto import (
     MapState, Time, CW, EventMask,
     CreateNotifyEvent, UnmapNotifyEvent, DestroyNotifyEvent,
+    EnterNotifyEvent, LeaveNotifyEvent,
 )
 
 BIND_FOCUS = "MOVE" # "NONE" - do nothing, "MOVE" - to the center of the window affected by the binding
@@ -226,7 +227,8 @@ async def on_i3_binding(i3_connection, event):
 def _subscribe_window(window):
     try:
         x_event_connection.core.ChangeWindowAttributes(
-            window, CW.EventMask, [EventMask.SubstructureNotify]
+            window, CW.EventMask,
+            [EventMask.SubstructureNotify | EventMask.EnterWindow | EventMask.LeaveWindow]
         )
     except:
         pass
@@ -271,6 +273,10 @@ def handle_x_event(event):
         if event.window in override_redirect_windows:
             override_redirect_windows.discard(event.window)
             if isinstance(event, UnmapNotifyEvent) and is_running:
+                asyncio.create_task(refresh_focus())
+    elif isinstance(event, (EnterNotifyEvent, LeaveNotifyEvent)):
+        if getattr(event, "mode", None) == 2:
+            if is_running:
                 asyncio.create_task(refresh_focus())
 
 
