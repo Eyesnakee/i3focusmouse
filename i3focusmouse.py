@@ -10,12 +10,13 @@ import xcffib
 from xcffib.xproto import (
     MapState, Time, CW, EventMask,
     CreateNotifyEvent, UnmapNotifyEvent, DestroyNotifyEvent,
-    EnterNotifyEvent, LeaveNotifyEvent,
 )
 
 BIND_FOCUS = "MOVE" # "NONE" - do nothing, "MOVE" - to the center of the window affected by the binding
 BIND_MOVE = "MOVE" # "NONE" - do nothing, "FOCUS" - focus window under mouse, "MOVE" - to the center of the window affected by the binding
 BIND_MODE_TOGGLE = "MOVE" # "NONE" - do nothing, "MOVE" - center cursor to the center of the window affected by the binding
+
+GRAB_FOCUS_INTERVAL = 0.02 # polling interval in seconds while a mouse button is held, None - disable the polling
 
 is_running = True
 xcb_connection = None
@@ -23,6 +24,7 @@ scheduled_focus_task = None
 main_loop_task = None
 x_event_task = None
 x_event_connection = None
+poll_task = None
 override_redirect_windows = set()
 
 
@@ -224,11 +226,51 @@ async def on_i3_binding(i3_connection, event):
         asyncio.create_task(refresh_focus())
 
 
+def _poll_and_focus_sync():
+    try:
+        root = xcb_connection.get_setup().roots[0].root
+        reply = xcb_connection.core.QueryPointer(root).reply()
+        if reply is None:
+            return
+        if not (reply.mask & 0x1F00):
+            return
+        child = reply.child
+        if not child:
+            return
+        attrs = xcb_connection.core.GetWindowAttributes(child).reply()
+        if attrs is None:
+            return
+        if attrs.override_redirect:
+            client = find_client_window(child)
+            if client is not None:
+                child = client
+                attrs = xcb_connection.core.GetWindowAttributes(child).reply()
+                if attrs is None:
+                    return
+        if attrs.map_state != MapState.Viewable:
+            return
+        xcb_connection.core.SetInputFocus(2, child, Time.CurrentTime)
+        xcb_connection.flush()
+    except:
+        pass
+
+
+async def pointer_button_poll_loop():
+    while is_running:
+        try:
+            await asyncio.to_thread(_poll_and_focus_sync)
+        except Exception:
+            pass
+        try:
+            await asyncio.sleep(GRAB_FOCUS_INTERVAL)
+        except asyncio.CancelledError:
+            return
+
+
 def _subscribe_window(window):
     try:
         x_event_connection.core.ChangeWindowAttributes(
-            window, CW.EventMask,
-            [EventMask.SubstructureNotify | EventMask.EnterWindow | EventMask.LeaveWindow]
+            window, CW.EventMask, [EventMask.SubstructureNotify]
         )
     except:
         pass
@@ -273,10 +315,6 @@ def handle_x_event(event):
         if event.window in override_redirect_windows:
             override_redirect_windows.discard(event.window)
             if isinstance(event, UnmapNotifyEvent) and is_running:
-                asyncio.create_task(refresh_focus())
-    elif isinstance(event, (EnterNotifyEvent, LeaveNotifyEvent)):
-        if getattr(event, "mode", None) == 2:
-            if is_running:
                 asyncio.create_task(refresh_focus())
 
 
@@ -338,7 +376,7 @@ async def run_i3_event_loop():
 
 
 async def main():
-    global xcb_connection, is_running, x_event_task
+    global xcb_connection, is_running, x_event_task, poll_task
 
     parser = argparse.ArgumentParser()
     parser.add_argument("--nice", type=int, help="nice value to set")
@@ -372,7 +410,7 @@ async def main():
         if not is_running:
             return
         is_running = False
-        for task in (main_loop_task, scheduled_focus_task, x_event_task):
+        for task in (main_loop_task, scheduled_focus_task, x_event_task, poll_task):
             if task is not None and not task.done():
                 task.cancel()
 
@@ -380,10 +418,12 @@ async def main():
     loop.add_signal_handler(signal.SIGTERM, shutdown)
 
     x_event_task = asyncio.create_task(listen_x_events())
+    if GRAB_FOCUS_INTERVAL is not None:
+        poll_task = asyncio.create_task(pointer_button_poll_loop())
 
     await run_i3_event_loop()
 
-    for task in (scheduled_focus_task, x_event_task):
+    for task in (scheduled_focus_task, x_event_task, poll_task):
         if task is not None and not task.done():
             task.cancel()
             try:
